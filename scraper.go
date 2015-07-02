@@ -79,9 +79,10 @@ var mameImg = flag.String("mame_img", "s,t,m,c", "Comma seperated order to prefe
 var stripUnicode = flag.Bool("strip_unicode", true, "If true, remove all non-ascii characters.")
 var downloadImages = flag.Bool("download_images", true, "If false, don't download any images, instead see if the expected file is stored locally already.")
 var scrapeAll = flag.Bool("scrape_all", false, "If true, scrape all systems listed in es_systems.cfg. All dir/path flags will be ignored.")
-var gdbImg = flag.String("gdb_img", "b", "Comma seperated order to prefer images, s=snapshot, b=boxart, f=fanart, a=banner, l=logo.")
+var gdbImg = flag.String("gdb_img", "b", "Comma seperated order to prefer images, s=snapshot, b=boxfront, r=boxrear, f=fanart, a=banner, l=logo.")
 var imgFormat = flag.String("img_format", "jpg", "jpg or png, the format to write the images.")
 var appendOut = flag.Bool("append", false, "If the gamelist file already exist skip files that are already listed and only append new files.")
+var rcmFormat = flag.Bool("rcm_format", false, "Use Rom Collection Manager format (nfo per game, directories for each type of image.)")
 
 var imgDirs map[string]struct{}
 
@@ -92,6 +93,15 @@ var UserCanceled = errors.New("user canceled")
 func GetFront(g gdb.Game) *gdb.Image {
 	for _, v := range g.BoxArt {
 		if v.Side == "front" {
+			return &v
+		}
+	}
+	return nil
+}
+
+func GetBack(g gdb.Game) *gdb.Image {
+	for _, v := range g.BoxArt {
+		if v.Side == "back" {
 			return &v
 		}
 	}
@@ -155,20 +165,75 @@ type datasources struct {
 
 // GameXML is the object used to export the <game> elements of the gamelist.xml.
 type GameXML struct {
-	XMLName     xml.Name `xml:"game"`
-	ID          string   `xml:"id,attr"`
-	Source      string   `xml:"source,attr"`
-	Path        string   `xml:"path"`
-	GameTitle   string   `xml:"name"`
-	Overview    string   `xml:"desc"`
-	Image       string   `xml:"image,omitempty"`
-	Thumb       string   `xml:"thumbnail,omitempty"`
-	Rating      float64  `xml:"rating,omitempty"`
-	ReleaseDate string   `xml:"releasedate"`
-	Developer   string   `xml:"developer"`
-	Publisher   string   `xml:"publisher"`
-	Genre       string   `xml:"genre"`
-	Players     int64    `xml:"players,omitempty"`
+	XMLName     xml.Name    `xml:"game"`
+	ID          string      `xml:"id,attr"`
+	Source      string      `xml:"source,attr"`
+	Path        string      `xml:"path"`
+	GameTitle   string      `xml:"name"`
+	Overview    string      `xml:"desc"`
+	Image       string      `xml:"image,omitempty"`
+	Thumb       string      `xml:"thumbnail,omitempty"`
+	Rating      float64     `xml:"rating,omitempty"`
+	ReleaseDate string      `xml:"releasedate"`
+	Developer   string      `xml:"developer"`
+	Publisher   string      `xml:"publisher"`
+	Genre       string      `xml:"genre"`
+	Players     int64       `xml:"players,omitempty"`
+	Images      []*RCMImage `xml:"-"`
+}
+
+type RCMGameXML struct {
+	XMLName        xml.Name `xml:"game"`
+	GameTitle      string   `xml:"title"`
+	OriginalTitle  string   `xml:"originalTitle"`
+	AlternateTitle string   `xml:"alternateTitle"`
+	// Fetch and hide in GameXML?
+	Platform  string `xml:"platform"`
+	Overview  string `xml:"plot"`
+	Publisher string `xml:"publisher"`
+	Developer string `xml:"developer"`
+	// Generate Year from ReleaseDate
+	Year        int64  `xml:"year"`
+	Genre       string `xml:"genre"`
+	DetailUrl   string `xml:"detailUrl"`
+	Players     int64  `xml:"maxPlayer"`
+	Region      string `xml:"region"`
+	Media       string `xml:"media"`
+	Perspective string `xml:"perspective"`
+	Controller  string `xml:"controller"`
+	Version     string `xml:"version"`
+	// Not sure about format for Rating
+	Rating   string      `xml:"rating"`
+	Votes    string      `xml:"votes"`
+	Favorite int64       `xml:"isFavorite"`
+	Launches int64       `xml:"launchCount"`
+	Images   []*RCMImage `xml:"image"`
+}
+
+func (gx *GameXML) RCMGameXML() *RCMGameXML {
+	g := RCMGameXML{}
+	g.GameTitle = gx.GameTitle
+	g.Overview = gx.Overview
+	g.Publisher = gx.Publisher
+	g.Developer = gx.Developer
+	if gx.ReleaseDate != "" {
+		yr, err := strconv.Atoi(gx.ReleaseDate[:4])
+		if err == nil {
+			g.Year = int64(yr)
+		}
+	}
+	g.Genre = gx.Genre
+	g.Players = gx.Players
+	//g.Rating = gx.Rating
+	g.Images = gx.Images
+	return &g
+}
+
+type RCMImage struct {
+	XMLName xml.Name `xml:"thumb"`
+	Path    string   `xml:"local,attr"`
+	Type    string   `xml:"type,attr"`
+	URL     string   `xml:",chardata"`
 }
 
 // GameListXML is the structure used to export the gamelist.xml file.
@@ -192,10 +257,12 @@ func fixPath(s string) string {
 	return fmt.Sprintf("./%s", s)
 }
 
-func GetImgPaths(r *ROM) (iPath, tPath string) {
+func GetImgPaths(r *ROM, iType string) (iPath, tPath string) {
 	var imgPath string
 	if *nestedImageDir {
 		imgPath = path.Join(*imageDir, r.fDir)
+	} else if *rcmFormat {
+		imgPath = iType
 	} else {
 		imgPath = *imageDir
 	}
@@ -221,8 +288,9 @@ func GetGDBGame(r *ROM, ds *datasources) (*GameXML, error) {
 	}
 	game := resp.Game[0]
 	imageURL := resp.ImageURL
+	images := make([]*RCMImage, 1)
 	imgPriority := strings.Split(*gdbImg, ",")
-	var iURL, tURL string
+	var iURL, tURL, iType string
 Loop:
 	for _, i := range imgPriority {
 		switch i {
@@ -230,6 +298,7 @@ Loop:
 			if len(game.Screenshot) != 0 {
 				iURL = game.Screenshot[0].Original.URL
 				tURL = game.Screenshot[0].Thumb
+				iType = "screenshot"
 				break Loop
 			}
 		case "b":
@@ -237,29 +306,47 @@ Loop:
 			if front != nil {
 				iURL = front.URL
 				tURL = front.Thumb
+				iType = "boxfront"
+				break Loop
+			}
+		case "r":
+			back := GetBack(game)
+			if back != nil {
+				iURL = back.URL
+				tURL = back.Thumb
+				iType = "boxback"
 				break Loop
 			}
 		case "f":
 			if len(game.FanArt) != 0 {
 				iURL = game.FanArt[0].Original.URL
 				tURL = game.FanArt[0].Thumb
+				iType = "fanart"
 				break Loop
 			}
 		case "a":
 			if len(game.Banner) != 0 {
 				iURL = game.Banner[0].URL
 				tURL = game.Banner[0].URL
+				iType = ""
 				break Loop
 			}
 		case "l":
 			if len(game.ClearLogo) != 0 {
 				iURL = game.ClearLogo[0].URL
 				tURL = game.ClearLogo[0].URL
+				iType = ""
 				break Loop
 			}
 		}
 	}
-	iPath, tPath := GetImgPaths(r)
+	iPath, tPath := GetImgPaths(r, iType)
+
+	img := RCMImage{}
+	img.Path = iPath
+	img.URL = imageURL + iURL
+	img.Type = iType
+	images = append(images, &img)
 
 	if iURL != "" && *downloadImages {
 		switch {
@@ -312,6 +399,7 @@ Loop:
 		Publisher:   game.Publisher,
 		Genre:       genre,
 		Source:      "theGamesDB.net",
+		Images:      images,
 	}
 	if iPath != "" {
 		gxml.Image = fixPath(*imagePath + "/" + strings.TrimPrefix(iPath, *imageDir))
@@ -337,7 +425,7 @@ func GetOVGDBGame(r *ROM, ds *datasources) (*GameXML, error) {
 	if err != nil {
 		return nil, err
 	}
-	iPath, _ := GetImgPaths(r)
+	iPath, _ := GetImgPaths(r, "")
 	if g.Art != "" && *downloadImages {
 		err = getImage(g.Art, iPath)
 		if err != nil {
@@ -369,7 +457,7 @@ func GetMAMEGame(r *ROM) (*GameXML, error) {
 	if err != nil {
 		return nil, err
 	}
-	iPath, _ := GetImgPaths(r)
+	iPath, _ := GetImgPaths(r, "")
 	if g.Art != "" && *downloadImages {
 		err = getImage(g.Art, iPath)
 		if err != nil {
@@ -443,6 +531,11 @@ type ROM struct {
 	XML   *GameXML
 	Bins  []string
 	Cue   bool
+}
+
+func GetBaseName(s string) string {
+	ext := path.Ext(s)
+	return s[:len(s)-len(ext)]
 }
 
 func (r *ROM) PopulatePaths() {
@@ -579,7 +672,7 @@ func (r *ROM) ProcessROM(ds *datasources) error {
 		xml.Overview = strings.Map(StripChars, xml.Overview)
 		xml.GameTitle = strings.Map(StripChars, xml.GameTitle)
 	}
-	iPath, tPath := GetImgPaths(r)
+	iPath, tPath := GetImgPaths(r, "")
 	iExists := exists(iPath)
 	tExists := exists(tPath)
 	if xml.Image == "" && iExists {
@@ -967,16 +1060,30 @@ func Scrape(ds *datasources) error {
 	if cerr != nil && cerr != UserCanceled {
 		return cerr
 	}
-	output, err := xml.MarshalIndent(gl, "  ", "    ")
-	if err != nil {
-		return err
-	}
 	if len(gl.GameList) == 0 {
 		return cerr
 	}
-	err = ioutil.WriteFile(*outputFile, append([]byte(xml.Header), output...), 0664)
-	if err != nil {
-		return err
+	if *rcmFormat {
+		for _, x := range gl.GameList {
+			nfoFile := fmt.Sprintf("%s.%s", GetBaseName(x.Path), "nfo")
+			output, err := xml.MarshalIndent(x.RCMGameXML(), "", "  ")
+			if err != nil {
+				return err
+			}
+			err = ioutil.WriteFile(nfoFile, output, 0664)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		output, err := xml.MarshalIndent(gl, "  ", "    ")
+		if err != nil {
+			return err
+		}
+		err = ioutil.WriteFile(*outputFile, append([]byte(xml.Header), output...), 0664)
+		if err != nil {
+			return err
+		}
 	}
 	return cerr
 }
@@ -1033,6 +1140,15 @@ func main() {
 	}
 	imgDirs = make(map[string]struct{})
 	ds := &datasources{}
+
+	if *rcmFormat {
+		*noThumb = true
+		*gdbImg = "b,f,r,s"
+		*imageSuffix = ""
+		*useGDB = true
+		*maxWidth = 1920
+	}
+
 	if *mame {
 		*useGDB = false
 		*useOVGDB = false
